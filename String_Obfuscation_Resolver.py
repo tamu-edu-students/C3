@@ -12,11 +12,16 @@
 from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.data import DataUtilities
 from ghidra.app.decompiler import DecompInterface
+import urllib  # For URL decoding
 import base64
 import math
 import string
+import threading
+import binascii
+import re
 
-#String detection
+
+#0. String detection
 def get_memory_data(address, size):
     """
     Reads raw data from memory starting at the specified address.
@@ -40,51 +45,52 @@ def get_memory_data(address, size):
         print("[ERROR] Error reading memory at {}: {}".format(address, e))
         return []
 
-def autodetect_obfuscated_strings():
+def process_block_thread(block, chunk_size, detected_strings_lock, detected_strings):
     """
-    Attempts to autodetect potential obfuscated strings in the program's memory.
-    :return: A list of potential addresses for obfuscated strings.
+    Processes a block in a thread-safe manner and appends detected strings.
+    """
+    if block.isInitialized():
+        try:
+            entropies, avg_entropy, std_dev = calculate_block_entropy(block, chunk_size)
+            start = block.getStart()
+            end = block.getEnd()
+            address = start
+
+            while address.compareTo(end) < 0:
+                remaining_size = end.subtract(address) + 1
+                effective_chunk_size = min(chunk_size, remaining_size)
+                data = get_memory_data(address, effective_chunk_size)
+                if data and is_potentially_obfuscated(data, avg_entropy, std_dev):
+                    with detected_strings_lock:
+                        detected_strings.append(address)
+                address = address.add(effective_chunk_size)
+        except Exception as e:
+            print("[ERROR] Error scanning block {}: {}".format(block.getName(), e))
+
+def autodetect_obfuscated_strings_parallel():
+    """
+    Multi-threaded version using the threading module for Jython compatibility.
     """
     memory = currentProgram.getMemory()
     detected_strings = []
+    detected_strings_lock = threading.Lock()
+    threads = []
+
     print("[INFO] Autodetecting obfuscated strings in memory...")
 
-    # Adjust the chunk size based on block size and typical string length
-    DEFAULT_CHUNK_SIZE = 64  # Start with 64 bytes for better efficiency
+    # Prompt user to select the chunk size
+    chunk_size = select_chunk_size()
+    print("[INFO] Using chunk size: {} bytes.".format(chunk_size))
 
-    # Iterate over memory blocks
     for block in memory.getBlocks():
-        if block.isInitialized():
-            try:
-                start = block.getStart()
-                end = block.getEnd()
-                address = start
+        thread = threading.Thread(target=process_block_thread, args=(block, chunk_size, detected_strings_lock, detected_strings))
+        threads.append(thread)
+        thread.start()
 
-                while address.compareTo(end) < 0:
-                    # Adjust chunk size to stay within bounds
-                    remaining_size = end.subtract(address) + 1
-                    chunk_size = min(DEFAULT_CHUNK_SIZE, remaining_size)
+    # Wait for all threads to complete
+    for thread in threads:
+        thread.join()
 
-                    # Read memory chunk
-                    data = get_memory_data(address, chunk_size)
-                    if not data:
-                        address = address.add(chunk_size)  # Move to next chunk
-                        continue
-
-                    # Detect obfuscated string in the current chunk
-                    if is_potentially_obfuscated(data):
-                        detected_strings.append(address)
-                        print("[INFO] Potential obfuscated string found at: {}".format(address))
-
-                        # Expand detection to adjacent memory regions
-                        address = expand_detected_region(address, block, chunk_size)
-                    else:
-                        address = address.add(chunk_size)  # Move to next chunk
-
-            except Exception as e:
-                print("[ERROR] Error scanning block {}: {}".format(block.getName(), e))
-
-    # Combine overlapping or adjacent results
     detected_strings = merge_adjacent_addresses(detected_strings)
     print("[INFO] Detection complete. {} potential strings found.".format(len(detected_strings)))
     return detected_strings
@@ -132,21 +138,32 @@ def merge_adjacent_addresses(addresses, threshold=16):
 
     for addr in addresses[1:]:
         last = merged[-1]
-        if addr.subtract(last) <= threshold:  # Check proximity
-            # Merge by extending the last address
-            merged[-1] = max(last, addr)
+        # Check if the addresses are in the same memory space
+        if last.getAddressSpace() == addr.getAddressSpace():
+            if addr.subtract(last) <= threshold:  # Check proximity
+                # Merge by extending the last address
+                merged[-1] = max(last, addr)
+            else:
+                merged.append(addr)
         else:
-            merged.append(addr)
+            print("[WARNING] Addresses {} and {} are in different spaces.".format(last, addr))
+            merged.append(addr)  # Keep both addresses separate
 
     return merged
 
-def is_potentially_obfuscated(data):
+def is_potentially_obfuscated(data, avg_entropy, std_dev):
     """
-    Heuristic to identify potentially obfuscated strings.
+    Heuristic to identify potentially obfuscated strings with dynamic entropy thresholds.
     :param data: A list of bytes.
+    :param avg_entropy: Average entropy for the block.
+    :param std_dev: Standard deviation of entropy for the block.
     :return: True if the data matches obfuscation patterns, False otherwise.
     """
     try:
+        # Ensure all values in data are valid bytes
+        if not all(isinstance(b, int) and 0 <= b <= 255 for b in data):
+            raise ValueError("Data contains invalid byte values.")
+
         # Convert data to string for easier analysis
         data_str = ''.join(chr(b) for b in data if b < 256)
 
@@ -156,33 +173,42 @@ def is_potentially_obfuscated(data):
         if non_printable_ratio > 0.5:  # More than 50% non-printable
             return True
 
-        # 2. Check for high entropy (randomness, often found in encryption/compression)
+        # 2. Check for high entropy relative to block statistics
         entropy = calculate_entropy(data)
-        if entropy > 4.0:  # Threshold for potential obfuscation
+        if entropy > avg_entropy + std_dev:  # Dynamic threshold
             return True
 
         # 3. Base64 detection
         try:
-            decoded = base64.b64decode(bytes(data), validate=True)
-            if decoded and all(chr(b) in string.printable for b in decoded):
-                return True
+            if re.match(r'^[A-Za-z0-9+/]*={0,2}$', data_str):  # Regex for Base64 strings
+                decoded = base64.b64decode(data_str + "=" * ((4 - len(data_str) % 4) % 4))
+                if decoded and all(32 <= c <= 126 for c in decoded):
+                    return True
         except (binascii.Error, ValueError):
             pass
 
-        # 4. XOR-like patterns (check for repeating patterns after XOR)
+        # 4. Base32 detection
+        if detect_base32(data):
+            return True
+
+        # 5. URL-encoding detection
+        if detect_url_encoding(data):
+            return True
+
+        # 6. XOR-like patterns (check for repeating patterns after XOR)
         if detect_xor_pattern(data):
             return True
 
-        # 5. Shift patterns (detect if bytes are consistently shifted)
+        # 7. Shift patterns (detect if bytes are consistently shifted)
         if detect_shift_pattern(data):
             return True
 
-        # 6. Hexadecimal-encoded strings
+        # 8. Hexadecimal-encoded strings
         try:
-            decoded = bytes.fromhex(data_str)
-            if all(chr(b) in string.printable for b in decoded):
+            decoded = binascii.unhexlify(data_str)  # Use binascii.unhexlify for decoding hex
+            if all(chr(b) in string.printable for b in decoded):  # Check if all characters are printable
                 return True
-        except ValueError:
+        except (binascii.Error, TypeError):  # Catch appropriate exceptions for invalid input
             pass
 
         return False
@@ -190,7 +216,56 @@ def is_potentially_obfuscated(data):
         print("[ERROR] Error in obfuscation detection: {}".format(e))
         return False
 
-#Helper Functions
+def select_chunk_size():
+    """
+    Prompt the user to select a chunk size from a predefined list.
+    :return: The selected chunk size.
+    """
+    chunk_sizes = [16, 32, 64, 128, 256]
+    default_size = 64
+    choice = askChoice(
+        "Select Chunk Size",
+        "Choose a chunk size for memory scanning:",
+        [str(size) for size in chunk_sizes],
+        str(default_size)
+    )
+    return int(choice)
+
+#Detection Helper Functions
+def calculate_block_entropy(block, chunk_size):
+    """
+    Calculates the entropy for each byte in a memory block with a user-defined chunk size.
+    :param block: A memory block object.
+    :param chunk_size: The size of each chunk for entropy calculation.
+    :return: List of entropies for the block, average entropy, and standard deviation.
+    """
+    try:
+        start = block.getStart()
+        end = block.getEnd()
+        entropies = []
+        address = start
+
+        while address.compareTo(end) < 0:
+            effective_chunk_size = min(chunk_size, end.subtract(address) + 1)
+            data = get_memory_data(address, effective_chunk_size)
+            if data:
+                entropy = calculate_entropy(data)
+                entropies.append(entropy)
+            address = address.add(effective_chunk_size)
+
+        # Calculate average entropy and standard deviation
+        if entropies:
+            avg_entropy = sum(entropies) / len(entropies)
+            std_dev = math.sqrt(sum((e - avg_entropy) ** 2 for e in entropies) / len(entropies))
+        else:
+            avg_entropy, std_dev = 0, 0
+
+        return entropies, avg_entropy, std_dev
+
+    except Exception as e:
+        print("[ERROR] Error calculating block entropy: {}".format(e))
+        return [], 0, 0
+
 def calculate_entropy(data):
     """
     Calculate the Shannon entropy of the given byte data.
@@ -204,7 +279,7 @@ def calculate_entropy(data):
     frequency = [data.count(b) / len(data) for b in set(data)]
 
     # Shannon entropy formula
-    return -sum(p * math.log2(p) for p in frequency if p > 0)
+    return -sum(p * math.log(p, 2) for p in frequency if p > 0)
 
 def detect_xor_pattern(data):
     """
@@ -230,7 +305,65 @@ def detect_shift_pattern(data):
             return True
     return False
 
-#Encoding and Pathing
+def detect_url_encoding(data):
+    """
+    Detect URL-encoded strings.
+    :param data: A list of bytes.
+    :return: True if the data matches URL encoding patterns, False otherwise.
+    """
+    try:
+        decoded = urllib.unquote(''.join(chr(b) for b in data))
+        if all(c in string.printable for c in decoded):  # Check if decoded string is printable
+            return True
+    except Exception:
+        pass
+    return False
+
+def detect_base32(data):
+    """
+    Detect Base32-encoded strings.
+    :param data: A list of bytes.
+    :return: True if the data matches Base32 encoding patterns, False otherwise.
+    """
+    try:
+        decoded = base64.b32decode(''.join(chr(b) for b in data), casefold=True)
+        if all(chr(c) in string.printable for c in decoded):  # Check if decoded content is printable
+            return True
+    except Exception:
+        pass
+    return False
+
+#Visualization
+def visualize_detected_strings(detected_strings, output_file="detected_strings.png"):
+    """
+    Visualizes the distribution of detected obfuscated strings within memory.
+    :param detected_strings: List of detected string addresses.
+    :param output_file: Filename to save the visualization as an image.
+    """
+    if not detected_strings:
+        print("[INFO] No strings to visualize.")
+        return
+
+    try:
+        addresses = [addr.getOffset() for addr in detected_strings]
+
+        # Generate histogram
+        plt.figure(figsize=(10, 6))
+        plt.hist(addresses, bins=50, color="blue", alpha=0.7, edgecolor="black")
+        plt.title("Distribution of Detected Strings in Memory")
+        plt.xlabel("Memory Address (Offset)")
+        plt.ylabel("Frequency")
+        plt.grid(axis="y", alpha=0.75)
+
+        # Save as image file
+        plt.savefig(output_file)
+        print("[INFO] Visualization saved to {}".format(output_file))
+        plt.close()
+    except Exception as e:
+        print("[ERROR] Failed to visualize detected strings: {}".format(e))
+
+
+#1. Encoding and Pathing
 # Helper: Track string usage in the program
 def track_string_pipeline(string_address):
     """
@@ -252,6 +385,7 @@ def track_string_pipeline(string_address):
 
     return call_graph
 
+#E&P Helpers
 # Helper: Detect and annotate transformations
 def detect_transformations(call_graph):
     """
@@ -290,7 +424,26 @@ def detect_transformations(call_graph):
 
     return transformations
 
-#Prediction and Reporting
+# Helper: Visualize the call graph
+def visualize_call_graph(call_graph, output_file="call_graph.dot"):
+    """
+    Outputs a DOT file for Graphviz.
+    :param call_graph: Dictionary {function_name: [list_of_references]}.
+    :param output_file: Name of the DOT file.
+    """
+    print("[INFO] Generating DOT file for call graph...")
+    try:
+        with open(output_file, "w") as f:
+            f.write("digraph CallGraph {\n")
+            for func, refs in call_graph.items():
+                for ref in refs:
+                    f.write('  "{}" -> "{}";\n'.format(ref, func))
+            f.write("}\n")
+        print("[INFO] DOT file generated successfully at: {}".format(output_file))
+    except Exception as e:
+        print("[ERROR] Failed to generate DOT file: {}".format(e))
+
+#2. Prediction and Reporting
 # Helper: Predict possible outputs
 def predict_outputs(transformations, string_data):
     """
@@ -402,6 +555,7 @@ def predict_outputs(transformations, string_data):
 
     return plausible_outputs
 
+#P&R Helpers
 def filter_plausible_outputs(outputs):
     """
     Filters predicted outputs to remove implausible results (e.g., non-ASCII).
@@ -414,6 +568,80 @@ def filter_plausible_outputs(outputs):
         if all(32 <= ord(c) < 127 for c in output):
             plausible.append((func_name, output))
     return plausible
+
+def validate_addresses(addresses):
+    """
+    Validate that all addresses in the list are properly formatted and accessible.
+    :param addresses: List of address objects.
+    :return: List of valid addresses.
+    """
+    memory = currentProgram.getMemory()
+    valid_addresses = []
+
+    for addr in addresses:
+        try:
+            if memory.contains(addr):
+                valid_addresses.append(addr)
+            else:
+                print("[WARNING] Address {} is out of bounds.".format(addr))
+        except Exception as e:
+            print("[ERROR] Failed to validate address {}: {}".format(addr, e))
+
+    return valid_addresses
+
+def process_detected_strings(detected_strings):
+    """
+    Process each detected string by tracking its pipeline and analyzing transformations.
+    Allows the user to manually input an address if needed.
+    :param detected_strings: List of detected addresses from Step 0.
+    """
+    valid_addresses = validate_addresses(detected_strings)
+
+    if not valid_addresses:
+        print("[WARNING] No valid detected strings. Please provide an address manually.")
+        manual_address = askAddress(
+            "Manual Address Entry",
+            "Enter the address of the string you want to analyze:"
+        )
+        if manual_address:
+            valid_addresses = [manual_address]
+        else:
+            print("[INFO] No addresses to process. Exiting.")
+            return
+
+    for addr in valid_addresses:
+        print("[INFO] Processing address: {}".format(addr))
+        try:
+            # Step 1: Track the pipeline
+            call_graph = track_string_pipeline(addr)
+
+            if not call_graph:
+                print("[WARNING] No call graph generated for address {}. Logging for manual review.".format(addr))
+                with open("failed_addresses.log", "a") as log_file:
+                    log_file.write("Failed to process call graph for address: {}\n".format(addr))
+                continue
+
+            # Visualize the call graph
+            visualize_call_graph(call_graph, output_file="call_graph_{}.dot".format(addr))
+
+            # Step 2: Detect transformations
+            transformations = detect_transformations(call_graph)
+
+            if not transformations:
+                print("[WARNING] No transformations detected for address {}. Logging for manual review.".format(addr))
+                with open("failed_addresses.log", "a") as log_file:
+                    log_file.write("Failed to detect transformations for address: {}\n".format(addr))
+                continue
+
+            print("[INFO] Transformations for address {}:".format(addr))
+            for func, transformation in transformations:
+                print("  Function: {}, Transformation: {}".format(func, transformation))
+
+        except Exception as e:
+            print("[ERROR] Failed to process address {}: {}".format(addr, e))
+            with open("failed_addresses.log", "a") as log_file:
+                log_file.write("Exception for address {}: {}\n".format(addr, e))
+
 
 # Utility: Decompile a function
 def decompile_function(func):
@@ -438,21 +666,7 @@ def decompile_function(func):
         print("[ERROR] Exception during decompilation of function {}: {}".format(func.getName(), e))
     return None
 
-# Helper: Visualize the call graph
-def visualize_call_graph(call_graph, output_file="call_graph.dot"):
-    """
-    Outputs a DOT file for Graphviz.
-    :param call_graph: Dictionary {function_name: [list_of_references]}.
-    :param output_file: Name of the DOT file.
-    """
-    print("Generating DOT file for call graph...")
-    with open(output_file, "w") as f:
-        f.write("digraph CallGraph {\n")
-        for func, refs in call_graph.items():
-            for ref in refs:
-                f.write('  "{}" -> "{}";\n'.format(ref, func))
-        f.write("}\n")
-
+#Analysis of single string
 def analyze_string(string_address):
     """
     Analyzes a single string address by:
@@ -500,41 +714,54 @@ def analyze_string(string_address):
             for output in possible_outputs:
                 print("  Function: {}, Output: {}".format(output[0], output[1]))
 
+
 def main():
     print("[INFO] Starting String Obfuscation Resolver...")
 
-    # Step 1: Autodetect potential obfuscated strings
+    # Step 0: Autodetect potential obfuscated strings
     print("[INFO] Attempting to autodetect obfuscated strings in memory...")
-    detected_strings = autodetect_obfuscated_strings()
+    detected_strings = autodetect_obfuscated_strings_parallel()
 
-    if detected_strings:
-        print("[INFO] Detected potential obfuscated strings:")
-        for i, addr in enumerate(detected_strings):
+    # Validate the detected addresses
+    valid_addresses = validate_addresses(detected_strings)
+
+    if valid_addresses:
+        print("[INFO] Valid detected obfuscated strings:")
+        for i, addr in enumerate(valid_addresses):
             print("  [{}] Address: {}".format(i, addr))
+
+        # Visualize the results
+        visualize_detected_strings(valid_addresses)
 
         # Let the user choose to process one or all detected strings
         choice = askChoice(
             "Select Option",
             "Choose to analyze one address, all addresses, or specify manually:",
-            ["Manual Input", "Analyze All"] + [str(addr) for addr in detected_strings],
+            ["Manual Input", "Analyze All"] + ["[{}] {}".format(i, addr) for i, addr in enumerate(valid_addresses)],
             "Analyze All"
         )
 
         if choice == "Manual Input":
-            string_address = askAddress("String Address", "Enter the address of the suspected obfuscated string:")
-            analyze_string(string_address)
+            # Allow user to manually input an address
+            manual_address = askAddress("String Address", "Enter the address of the suspected obfuscated string:")
+            if manual_address:
+                process_detected_strings([manual_address])
+            else:
+                print("[WARNING] No manual address provided. Exiting.")
         elif choice == "Analyze All":
             print("[INFO] Analyzing all detected strings...")
-            for addr in detected_strings:
-                print("\n[INFO] Processing address: {}".format(addr))
-                analyze_string(addr)
+            process_detected_strings(valid_addresses)
         else:
-            string_address = detected_strings[int(choice.split(" ")[0])]
-            analyze_string(string_address)
+            # Process a single selected address
+            selected_index = int(choice.split(" ")[0].strip("[]"))
+            process_detected_strings([valid_addresses[selected_index]])
     else:
-        print("[WARNING] No obfuscated strings detected. Please specify an address manually.")
-        string_address = askAddress("String Address", "Enter the address of the suspected obfuscated string:")
-        analyze_string(string_address)
+        print("[WARNING] No valid obfuscated strings detected.")
+        manual_address = askAddress("Manual Address Entry", "Enter the address of the string you want to analyze:")
+        if manual_address:
+            process_detected_strings([manual_address])
+        else:
+            print("[INFO] No addresses to process. Exiting.")
 
     print("[INFO] String Obfuscation Resolver completed.")
 
