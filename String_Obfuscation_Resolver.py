@@ -13,7 +13,10 @@ from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.data import DataUtilities
 from ghidra.app.decompiler import DecompInterface
 import base64
+import math
+import string
 
+#String detection
 def get_memory_data(address, size):
     """
     Reads raw data from memory starting at the specified address.
@@ -37,8 +40,6 @@ def get_memory_data(address, size):
         print("[ERROR] Error reading memory at {}: {}".format(address, e))
         return []
 
-
-
 def autodetect_obfuscated_strings():
     """
     Attempts to autodetect potential obfuscated strings in the program's memory.
@@ -47,6 +48,9 @@ def autodetect_obfuscated_strings():
     memory = currentProgram.getMemory()
     detected_strings = []
     print("[INFO] Autodetecting obfuscated strings in memory...")
+
+    # Adjust the chunk size based on block size and typical string length
+    DEFAULT_CHUNK_SIZE = 64  # Start with 64 bytes for better efficiency
 
     # Iterate over memory blocks
     for block in memory.getBlocks():
@@ -59,20 +63,82 @@ def autodetect_obfuscated_strings():
                 while address.compareTo(end) < 0:
                     # Adjust chunk size to stay within bounds
                     remaining_size = end.subtract(address) + 1
-                    chunk_size = min(16, remaining_size)  # Adjust as needed
+                    chunk_size = min(DEFAULT_CHUNK_SIZE, remaining_size)
+
+                    # Read memory chunk
                     data = get_memory_data(address, chunk_size)
+                    if not data:
+                        address = address.add(chunk_size)  # Move to next chunk
+                        continue
+
+                    # Detect obfuscated string in the current chunk
                     if is_potentially_obfuscated(data):
                         detected_strings.append(address)
                         print("[INFO] Potential obfuscated string found at: {}".format(address))
-                    address = address.add(chunk_size)
+
+                        # Expand detection to adjacent memory regions
+                        address = expand_detected_region(address, block, chunk_size)
+                    else:
+                        address = address.add(chunk_size)  # Move to next chunk
 
             except Exception as e:
                 print("[ERROR] Error scanning block {}: {}".format(block.getName(), e))
 
+    # Combine overlapping or adjacent results
+    detected_strings = merge_adjacent_addresses(detected_strings)
+    print("[INFO] Detection complete. {} potential strings found.".format(len(detected_strings)))
     return detected_strings
 
+def expand_detected_region(address, block, chunk_size):
+    """
+    Expands the detected region to include adjacent memory that may also be part of the string.
+    :param address: Starting address of the detected string.
+    :param block: Memory block being analyzed.
+    :param chunk_size: Current chunk size.
+    :return: New end address after expansion.
+    """
+    memory = currentProgram.getMemory()
+    start = address
+    end = address.add(chunk_size)
 
+    # Expand forwards
+    while end.compareTo(block.getEnd()) < 0:
+        data = get_memory_data(end, chunk_size)
+        if not data or not is_potentially_obfuscated(data):
+            break
+        end = end.add(chunk_size)
 
+    # Expand backwards
+    while start.compareTo(block.getStart()) > 0:
+        data = get_memory_data(start.subtract(chunk_size), chunk_size)
+        if not data or not is_potentially_obfuscated(data):
+            break
+        start = start.subtract(chunk_size)
+
+    return start, end
+
+def merge_adjacent_addresses(addresses, threshold=16):
+    """
+    Merges adjacent or overlapping addresses.
+    :param addresses: List of addresses.
+    :param threshold: Maximum distance between two addresses to consider them adjacent.
+    :return: Merged list of addresses.
+    """
+    if not addresses:
+        return []
+
+    addresses = sorted(addresses)
+    merged = [addresses[0]]
+
+    for addr in addresses[1:]:
+        last = merged[-1]
+        if addr.subtract(last) <= threshold:  # Check proximity
+            # Merge by extending the last address
+            merged[-1] = max(last, addr)
+        else:
+            merged.append(addr)
+
+    return merged
 
 def is_potentially_obfuscated(data):
     """
@@ -81,27 +147,90 @@ def is_potentially_obfuscated(data):
     :return: True if the data matches obfuscation patterns, False otherwise.
     """
     try:
-        # Example heuristics:
-        # - Contains many non-printable characters
-        # - Matches Base64-like patterns
-        # - XOR-like patterns (e.g., repeated transformations)
-        printable = sum(32 <= b <= 126 for b in data)
-        if printable < len(data) * 0.5:  # Mostly non-printable
+        # Convert data to string for easier analysis
+        data_str = ''.join(chr(b) for b in data if b < 256)
+
+        # 1. Check ratio of printable characters
+        printable = sum(1 for b in data if chr(b) in string.printable)
+        non_printable_ratio = (len(data) - printable) / len(data)
+        if non_printable_ratio > 0.5:  # More than 50% non-printable
             return True
 
-        # Base64-like pattern detection
+        # 2. Check for high entropy (randomness, often found in encryption/compression)
+        entropy = calculate_entropy(data)
+        if entropy > 4.0:  # Threshold for potential obfuscation
+            return True
+
+        # 3. Base64 detection
         try:
-            decoded = base64.b64decode(bytes(data)).decode("utf-8")
-            if len(decoded) > 0:
+            decoded = base64.b64decode(bytes(data), validate=True)
+            if decoded and all(chr(b) in string.printable for b in decoded):
                 return True
-        except:
+        except (binascii.Error, ValueError):
+            pass
+
+        # 4. XOR-like patterns (check for repeating patterns after XOR)
+        if detect_xor_pattern(data):
+            return True
+
+        # 5. Shift patterns (detect if bytes are consistently shifted)
+        if detect_shift_pattern(data):
+            return True
+
+        # 6. Hexadecimal-encoded strings
+        try:
+            decoded = bytes.fromhex(data_str)
+            if all(chr(b) in string.printable for b in decoded):
+                return True
+        except ValueError:
             pass
 
         return False
     except Exception as e:
-        print("Error in obfuscation detection: {}".format(e))
+        print("[ERROR] Error in obfuscation detection: {}".format(e))
         return False
 
+#Helper Functions
+def calculate_entropy(data):
+    """
+    Calculate the Shannon entropy of the given byte data.
+    :param data: A list of byte values.
+    :return: Entropy value (float).
+    """
+    if not data:
+        return 0.0
+
+    # Count frequency of each byte
+    frequency = [data.count(b) / len(data) for b in set(data)]
+
+    # Shannon entropy formula
+    return -sum(p * math.log2(p) for p in frequency if p > 0)
+
+def detect_xor_pattern(data):
+    """
+    Detect XOR-like patterns in data by checking repeating transformations.
+    :param data: A list of bytes.
+    :return: True if a pattern suggests XOR obfuscation, False otherwise.
+    """
+    for key in range(1, 256):  # Try all possible 1-byte XOR keys
+        decoded = [b ^ key for b in data]
+        if all(32 <= char <= 126 for char in decoded):  # Printable ASCII
+            return True
+    return False
+
+def detect_shift_pattern(data):
+    """
+    Detect if data appears to be shifted by a fixed value.
+    :param data: A list of bytes.
+    :return: True if a consistent shift pattern is detected, False otherwise.
+    """
+    for shift in range(-32, 32):  # Test small shifts
+        shifted = [(b + shift) & 0xFF for b in data]
+        if all(32 <= char <= 126 for char in shifted):  # Printable ASCII
+            return True
+    return False
+
+#Encoding and Pathing
 # Helper: Track string usage in the program
 def track_string_pipeline(string_address):
     """
@@ -122,7 +251,6 @@ def track_string_pipeline(string_address):
             call_graph[func_name].append(ref.getFromAddress())
 
     return call_graph
-
 
 # Helper: Detect and annotate transformations
 def detect_transformations(call_graph):
@@ -162,8 +290,7 @@ def detect_transformations(call_graph):
 
     return transformations
 
-
-
+#Prediction and Reporting
 # Helper: Predict possible outputs
 def predict_outputs(transformations, string_data):
     """
@@ -275,7 +402,6 @@ def predict_outputs(transformations, string_data):
 
     return plausible_outputs
 
-
 def filter_plausible_outputs(outputs):
     """
     Filters predicted outputs to remove implausible results (e.g., non-ASCII).
@@ -288,8 +414,6 @@ def filter_plausible_outputs(outputs):
         if all(32 <= ord(c) < 127 for c in output):
             plausible.append((func_name, output))
     return plausible
-
-
 
 # Utility: Decompile a function
 def decompile_function(func):
@@ -314,8 +438,6 @@ def decompile_function(func):
         print("[ERROR] Exception during decompilation of function {}: {}".format(func.getName(), e))
     return None
 
-
-
 # Helper: Visualize the call graph
 def visualize_call_graph(call_graph, output_file="call_graph.dot"):
     """
@@ -330,7 +452,6 @@ def visualize_call_graph(call_graph, output_file="call_graph.dot"):
             for ref in refs:
                 f.write('  "{}" -> "{}";\n'.format(ref, func))
         f.write("}\n")
-
 
 def analyze_string(string_address):
     """
@@ -416,7 +537,6 @@ def main():
         analyze_string(string_address)
 
     print("[INFO] String Obfuscation Resolver completed.")
-
 
 # Run the script
 main()
