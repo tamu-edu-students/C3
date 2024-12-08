@@ -39,7 +39,7 @@ def get_memory_data(address, size):
                 print("[DEBUG] Address {} is out of bounds.".format(current_address))
                 break
             byte = memory.getByte(current_address)
-            data.append(byte & 0xFF)  # Convert to unsigned byte
+            data.append(byte & 0xFF)
         return data
     except Exception as e:
         print("[ERROR] Error reading memory at {}: {}".format(address, e))
@@ -98,10 +98,6 @@ def autodetect_obfuscated_strings_parallel():
 def expand_detected_region(address, block, chunk_size):
     """
     Expands the detected region to include adjacent memory that may also be part of the string.
-    :param address: Starting address of the detected string.
-    :param block: Memory block being analyzed.
-    :param chunk_size: Current chunk size.
-    :return: New end address after expansion.
     """
     memory = currentProgram.getMemory()
     start = address
@@ -126,9 +122,6 @@ def expand_detected_region(address, block, chunk_size):
 def merge_adjacent_addresses(addresses, threshold=16):
     """
     Merges adjacent or overlapping addresses.
-    :param addresses: List of addresses.
-    :param threshold: Maximum distance between two addresses to consider them adjacent.
-    :return: Merged list of addresses.
     """
     if not addresses:
         return []
@@ -154,10 +147,6 @@ def merge_adjacent_addresses(addresses, threshold=16):
 def is_potentially_obfuscated(data, avg_entropy, std_dev):
     """
     Heuristic to identify potentially obfuscated strings with dynamic entropy thresholds.
-    :param data: A list of bytes.
-    :param avg_entropy: Average entropy for the block.
-    :param std_dev: Standard deviation of entropy for the block.
-    :return: True if the data matches obfuscation patterns, False otherwise.
     """
     try:
         # Ensure all values in data are valid bytes
@@ -219,7 +208,6 @@ def is_potentially_obfuscated(data, avg_entropy, std_dev):
 def select_chunk_size():
     """
     Prompt the user to select a chunk size from a predefined list.
-    :return: The selected chunk size.
     """
     chunk_sizes = [16, 32, 64, 128, 256]
     default_size = 64
@@ -235,9 +223,6 @@ def select_chunk_size():
 def calculate_block_entropy(block, chunk_size):
     """
     Calculates the entropy for each byte in a memory block with a user-defined chunk size.
-    :param block: A memory block object.
-    :param chunk_size: The size of each chunk for entropy calculation.
-    :return: List of entropies for the block, average entropy, and standard deviation.
     """
     try:
         start = block.getStart()
@@ -269,8 +254,6 @@ def calculate_block_entropy(block, chunk_size):
 def calculate_entropy(data):
     """
     Calculate the Shannon entropy of the given byte data.
-    :param data: A list of byte values.
-    :return: Entropy value (float).
     """
     if not data:
         return 0.0
@@ -284,8 +267,6 @@ def calculate_entropy(data):
 def detect_xor_pattern(data):
     """
     Detect XOR-like patterns in data by checking repeating transformations.
-    :param data: A list of bytes.
-    :return: True if a pattern suggests XOR obfuscation, False otherwise.
     """
     for key in range(1, 256):  # Try all possible 1-byte XOR keys
         decoded = [b ^ key for b in data]
@@ -296,8 +277,6 @@ def detect_xor_pattern(data):
 def detect_shift_pattern(data):
     """
     Detect if data appears to be shifted by a fixed value.
-    :param data: A list of bytes.
-    :return: True if a consistent shift pattern is detected, False otherwise.
     """
     for shift in range(-32, 32):  # Test small shifts
         shifted = [(b + shift) & 0xFF for b in data]
@@ -308,12 +287,10 @@ def detect_shift_pattern(data):
 def detect_url_encoding(data):
     """
     Detect URL-encoded strings.
-    :param data: A list of bytes.
-    :return: True if the data matches URL encoding patterns, False otherwise.
     """
     try:
         decoded = urllib.unquote(''.join(chr(b) for b in data))
-        if all(c in string.printable for c in decoded):  # Check if decoded string is printable
+        if all(c in string.printable for c in decoded):
             return True
     except Exception:
         pass
@@ -322,8 +299,6 @@ def detect_url_encoding(data):
 def detect_base32(data):
     """
     Detect Base32-encoded strings.
-    :param data: A list of bytes.
-    :return: True if the data matches Base32 encoding patterns, False otherwise.
     """
     try:
         decoded = base64.b32decode(''.join(chr(b) for b in data), casefold=True)
@@ -337,8 +312,6 @@ def detect_base32(data):
 def visualize_detected_strings(detected_strings, output_file="detected_strings.png"):
     """
     Visualizes the distribution of detected obfuscated strings within memory.
-    :param detected_strings: List of detected string addresses.
-    :param output_file: Filename to save the visualization as an image.
     """
     if not detected_strings:
         print("[INFO] No strings to visualize.")
@@ -368,8 +341,6 @@ def visualize_detected_strings(detected_strings, output_file="detected_strings.p
 def track_string_pipeline(string_address):
     """
     Tracks the pipeline of a string in the program by identifying functions and references.
-    :param string_address: The memory address of the string.
-    :return: A call graph as a dictionary {function_name: [list_of_references]}.
     """
     print("Tracking pipeline for string at {}...".format(string_address))
     references = getReferencesTo(string_address)
@@ -391,8 +362,6 @@ def detect_transformations(call_graph):
     """
     Detects and annotates transformations applied to the string, including bitwise, mathematical,
     and string manipulation operations.
-    :param call_graph: The call graph of functions and references.
-    :return: A list of transformations [(function_name, transformation_description)].
     """
     print("[INFO] Analyzing transformations in the pipeline...")
     transformations = []
@@ -428,8 +397,6 @@ def detect_transformations(call_graph):
 def visualize_call_graph(call_graph, output_file="call_graph.dot"):
     """
     Outputs a DOT file for Graphviz.
-    :param call_graph: Dictionary {function_name: [list_of_references]}.
-    :param output_file: Name of the DOT file.
     """
     print("[INFO] Generating DOT file for call graph...")
     try:
@@ -443,14 +410,12 @@ def visualize_call_graph(call_graph, output_file="call_graph.dot"):
     except Exception as e:
         print("[ERROR] Failed to generate DOT file: {}".format(e))
 
+
 #2. Prediction and Reporting
 # Helper: Predict possible outputs
 def predict_outputs(transformations, string_data):
     """
     Predicts possible outputs of the obfuscated string based on transformations.
-    :param transformations: List of transformations [(function_name, transformation_description)].
-    :param string_data: The raw bytes of the string.
-    :return: A list of possible outputs [(function_name, output_string)].
     """
     print("Predicting possible outputs...")
     possible_outputs = []
@@ -559,8 +524,6 @@ def predict_outputs(transformations, string_data):
 def filter_plausible_outputs(outputs):
     """
     Filters predicted outputs to remove implausible results (e.g., non-ASCII).
-    :param outputs: List of possible outputs [(function_name, output_string)].
-    :return: Filtered list of plausible outputs.
     """
     plausible = []
     for func_name, output in outputs:
@@ -572,8 +535,6 @@ def filter_plausible_outputs(outputs):
 def validate_addresses(addresses):
     """
     Validate that all addresses in the list are properly formatted and accessible.
-    :param addresses: List of address objects.
-    :return: List of valid addresses.
     """
     memory = currentProgram.getMemory()
     valid_addresses = []
@@ -593,7 +554,6 @@ def process_detected_strings(detected_strings):
     """
     Process each detected string by tracking its pipeline and analyzing transformations.
     Allows the user to manually input an address if needed.
-    :param detected_strings: List of detected addresses from Step 0.
     """
     valid_addresses = validate_addresses(detected_strings)
 
@@ -642,13 +602,10 @@ def process_detected_strings(detected_strings):
             with open("failed_addresses.log", "a") as log_file:
                 log_file.write("Exception for address {}: {}\n".format(addr, e))
 
-
 # Utility: Decompile a function
 def decompile_function(func):
     """
     Decompiles a function using Ghidra's decompiler.
-    :param func: The function to decompile.
-    :return: Decompiled code as a string, or None if decompilation fails.
     """
     if not func:
         print("[ERROR] Invalid function passed to decompiler.")
